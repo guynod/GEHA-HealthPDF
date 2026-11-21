@@ -1,0 +1,403 @@
+{
+  "template": "GEHA-Member-Claim-Submission.pdf",
+  "sha256": "a74a4f0decd3dd2bd82d705e40e25ac6088064d3245b8365c3357eb631d22497",
+  "publisher": "GEHA",
+  "revision": "UMF0022-GEHA 1025 UA",
+  "verified_on": "2026-11-20",
+  "source": "https://www.mygeha.com/print/UMF0022-GEHA.pdf",
+  "claim_email": "GEHA-ClaimSubmission@mygeha.com",
+  "text": {
+    "plan_name": {
+      "page": 0,
+      "rect": [
+        126.96,
+        474.017,
+        304.61,
+        490.148
+      ]
+    },
+    "group_number": {
+      "page": 0,
+      "rect": [
+        391.95,
+        473.708,
+        554.226,
+        490.148
+      ]
+    },
+    "subscriber": {
+      "page": 0,
+      "rect": [
+        133.16,
+        452.708,
+        298.623,
+        469.148
+      ]
+    },
+    "member_id": {
+      "page": 0,
+      "rect": [
+        360.0,
+        452.708,
+        554.192,
+        469.148
+      ]
+    },
+    "patient": {
+      "page": 0,
+      "rect": [
+        109.44,
+        431.708,
+        298.597,
+        448.148
+      ]
+    },
+    "contact": {
+      "page": 0,
+      "rect": [
+        229.5,
+        409.788,
+        554.4,
+        426.228
+      ]
+    },
+    "dob_month": {
+      "page": 0,
+      "rect": [
+        421.0,
+        430.038,
+        446.969,
+        446.898
+      ]
+    },
+    "dob_day": {
+      "page": 0,
+      "rect": [
+        456.329,
+        430.038,
+        481.529,
+        446.898
+      ]
+    },
+    "dob_year": {
+      "page": 0,
+      "rect": [
+        490.889,
+        430.288,
+        526.889,
+        447.148
+      ]
+    },
+    "date_month": {
+      "page": 0,
+      "rect": [
+        428.4,
+        387.052,
+        454.369,
+        403.912
+      ]
+    },
+    "date_day": {
+      "page": 0,
+      "rect": [
+        463.729,
+        387.052,
+        488.929,
+        403.912
+      ]
+    },
+    "date_year": {
+      "page": 0,
+      "rect": [
+        498.289,
+        387.302,
+        534.289,
+        404.162
+      ]
+    },
+    "facility": {
+      "page": 0,
+      "rect": [
+        108.0,
+        366.804,
+        298.8,
+        383.76
+      ]
+    },
+    "provider": {
+      "page": 0,
+      "rect": [
+        113.76,
+        345.204,
+        298.8,
+        362.16
+      ]
+    },
+    "tax_id": {
+      "page": 0,
+      "rect": [
+        439.626,
+        367.391,
+        554.4,
+        383.76
+      ]
+    },
+    "provider_address": {
+      "page": 0,
+      "rect": [
+        120.96,
+        323.804,
+        554.4,
+        340.76
+      ]
+    },
+    "country": {
+      "page": 0,
+      "rect": [
+        185.72,
+        137.724,
+        288.72,
+        154.68
+      ]
+    },
+    "usd": {
+      "page": 0,
+      "rect": [
+        359.28,
+        137.724,
+        404.72,
+        154.68
+      ]
+    },
+    "diagnosis": {
+      "page": 0,
+      "rect": [
+        451.4,
+        137.724,
+        554.4,
+        154.68
+      ]
+    },
+    "description": {
+      "page": 0,
+      "rect": [
+        46.3372,
+        48.4244,
+        565.2,
+        85.32
+      ]
+    }
+  },
+  "checkboxes": {
+    "mode.domestic": {
+      "page": 0,
+      "rect": [
+        56.16,
+        243.958,
+        68.922,
+        256.72
+      ]
+    },
+    "mode.overseas": {
+      "page": 0,
+      "rect": [
+        56.16,
+        167.518,
+        68.922,
+        180.28
+      ]
+    },
+    "domestic.office_visit": {
+      "page": 0,
+      "rect": [
+        151.92,
+        261.638,
+        164.682,
+        274.4
+      ]
+    },
+    "domestic.flu_shot": {
+      "page": 0,
+      "rect": [
+        245.966,
+        261.638,
+        257.682,
+        274.4
+      ]
+    },
+    "domestic.breast_pump": {
+      "page": 0,
+      "rect": [
+        344.282,
+        261.638,
+        357.044,
+        274.4
+      ]
+    },
+    "domestic.lab": {
+      "page": 0,
+      "rect": [
+        437.2,
+        261.638,
+        449.962,
+        274.4
+      ]
+    },
+    "domestic.immunization": {
+      "page": 0,
+      "rect": [
+        151.92,
+        243.918,
+        164.682,
+        256.68
+      ]
+    },
+    "domestic.durable_medical_equipment": {
+      "page": 0,
+      "rect": [
+        244.92,
+        243.918,
+        257.682,
+        256.68
+      ]
+    },
+    "domestic.xray": {
+      "page": 0,
+      "rect": [
+        437.2,
+        243.918,
+        449.962,
+        256.68
+      ]
+    },
+    "domestic.prescription": {
+      "page": 0,
+      "rect": [
+        151.92,
+        226.198,
+        164.682,
+        238.96
+      ]
+    },
+    "domestic.behavioral_health": {
+      "page": 0,
+      "rect": [
+        244.92,
+        226.198,
+        257.682,
+        238.96
+      ]
+    },
+    "domestic.substance_use": {
+      "page": 0,
+      "rect": [
+        344.282,
+        226.198,
+        357.044,
+        238.96
+      ]
+    },
+    "domestic.other": {
+      "page": 0,
+      "rect": [
+        437.2,
+        226.198,
+        449.962,
+        238.96
+      ]
+    },
+    "overseas.office_visit": {
+      "page": 0,
+      "rect": [
+        151.92,
+        192.638,
+        164.682,
+        205.4
+      ]
+    },
+    "overseas.hospital": {
+      "page": 0,
+      "rect": [
+        244.92,
+        192.638,
+        257.682,
+        205.4
+      ]
+    },
+    "overseas.emergency": {
+      "page": 0,
+      "rect": [
+        344.282,
+        192.638,
+        357.044,
+        205.4
+      ]
+    },
+    "overseas.lab": {
+      "page": 0,
+      "rect": [
+        151.92,
+        174.918,
+        164.682,
+        187.68
+      ]
+    },
+    "overseas.xray": {
+      "page": 0,
+      "rect": [
+        244.92,
+        174.918,
+        257.682,
+        187.68
+      ]
+    },
+    "overseas.prescription": {
+      "page": 0,
+      "rect": [
+        344.282,
+        174.918,
+        357.044,
+        187.68
+      ]
+    },
+    "overseas.other": {
+      "page": 0,
+      "rect": [
+        151.92,
+        157.198,
+        164.682,
+        169.96
+      ]
+    },
+    "payment.member": {
+      "page": 0,
+      "rect": [
+        135.16,
+        386.018,
+        147.18,
+        398.038
+      ]
+    },
+    "payment.provider": {
+      "page": 0,
+      "rect": [
+        200.42,
+        386.018,
+        212.44,
+        398.038
+      ]
+    }
+  },
+  "required_subscriber": [
+    "name",
+    "member_id",
+    "plan_name",
+    "group_number"
+  ],
+  "requires_us_tax_id": true,
+  "overseas_only_text": [
+    "country",
+    "usd",
+    "diagnosis"
+  ]
+}

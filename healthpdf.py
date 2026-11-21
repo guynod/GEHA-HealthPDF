@@ -1,0 +1,512 @@
+"""Portable claim packets for an assistant's Python environment. Python 3.10+."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import re
+import shutil
+import tempfile
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from pypdf import PdfReader, PdfWriter, Transformation
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+import reportlab
+
+
+ROOT = Path(__file__).resolve().parent
+VERSION = "0.1.0"
+CENT = Decimal("0.01")
+TRACKER_COLUMNS = [
+    "claim_id", "patient", "provider", "service_date", "country", "currency",
+    "original_amount", "submitted_usd", "fx_rate", "fx_date", "fx_source",
+    "submission_status", "submitted_date", "insurer_claim_number", "eob_date",
+    "insurer_paid_usd", "member_share_usd", "provider_receipt", "payment_proof",
+    "eob_saved", "insurer_deposit_verified", "hsa_reimbursed", "notes",
+]
+
+
+def money(value):
+    """Accept exact cents, with an explicit error for malformed or negative money."""
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as error:
+        raise ValueError("Amount must be a number") from error
+    if not number.is_finite() or number < 0 or number != number.quantize(CENT):
+        raise ValueError("Amount must be nonnegative and have at most two decimal places")
+    return number
+
+
+def required(obj, key):
+    value = obj.get(key)
+    if value is None or not str(value).strip():
+        raise ValueError(f"Please provide {key.replace('_', ' ')}")
+    return value
+
+
+def iso_date(value):
+    return date.fromisoformat(str(value)).isoformat()
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_json(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def inventory(paths):
+    result = []
+    seen = {}
+    for filename in paths:
+        path = Path(filename)
+        sha = digest(path)
+        row = {"file": str(path), "sha256": sha, "bytes": path.stat().st_size}
+        if sha in seen:
+            row["duplicate_of"] = seen[sha]
+        else:
+            seen[sha] = str(path)
+        if path.suffix.lower() == ".pdf":
+            reader = PdfReader(path)
+            row["pages"] = len(reader.pages)
+            row["text"] = [page.extract_text() or "" for page in reader.pages]
+            row["needs_visual_reading"] = any(len(t.strip()) < 70 for t in row["text"])
+        result.append(row)
+    return result
+
+
+def convert(amount, currency, service_date, fx=None):
+    """Use supplied source-bound FX or look up date/currency metadata automatically."""
+    amount = money(amount)
+    currency = str(currency).upper()
+    requested = iso_date(service_date)
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("Use a three-letter currency code")
+    if currency == "USD":
+        return {"usd": str(amount), "rate": "1", "date": requested, "source": "USD invoice"}
+    if fx and "actual_usd" in fx:
+        usd = money(fx["actual_usd"])
+        if usd <= 0 or amount <= 0:
+            raise ValueError("Use the positive documented USD payment for this expense")
+        return {"usd": str(usd), "rate": str(usd / amount), "date": iso_date(required(fx, "date")),
+                "source": str(required(fx, "source")), "method": "documented USD payment"}
+    if fx is None:
+        query = urlencode({"base": currency, "symbols": "USD"})
+        url = f"https://api.frankfurter.dev/v1/{requested}?{query}"
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "HealthPDF/0.1"}), timeout=20) as response:
+                data = json.load(response)
+            fx = {"usd_per_unit": data["rates"]["USD"], "date": data["date"], "source": url}
+        except Exception as error:
+            raise ValueError(
+                "Rate lookup unavailable. The assistant can use web search to supply a cited "
+                "historical USD-per-unit rate for the date of care and run this step again."
+            ) from error
+    rate = Decimal(str(required(fx, "usd_per_unit")))
+    actual_date = iso_date(required(fx, "date"))
+    source = str(required(fx, "source"))
+    if not rate.is_finite() or rate <= 0 or actual_date > requested:
+        raise ValueError("Use a positive rate dated on or before the service date")
+    return {
+        "usd": str((amount * rate).quantize(CENT, rounding=ROUND_HALF_UP)),
+        "rate": str(rate), "date": actual_date, "source": source,
+    }
+
+
+def font_name():
+    if "HealthPDF" not in pdfmetrics.getRegisteredFontNames():
+        path = Path(reportlab.__file__).parent / "fonts" / "Vera.ttf"
+        pdfmetrics.registerFont(TTFont("HealthPDF", str(path)))
+    return "HealthPDF"
+
+
+def draw_text(pdf, value, rect):
+    """Wrap measured text inside the actual form widget and reject clipping."""
+    value = str(value)
+    font = font_name()
+    glyphs = pdfmetrics.getFont(font).face.charToGlyph
+    if any(ord(ch) not in glyphs for ch in value if not ch.isspace()):
+        raise ValueError("A form value needs an English transliteration or a font supporting its script")
+    left, bottom, right, top = map(float, rect)
+    width, height = right - left - 4, top - bottom - 3
+    for size in (10, 9, 8, 7):
+        words = value.split()
+        lines = []
+        line = ""
+        for word in words:
+            trial = (line + " " + word).strip()
+            if pdfmetrics.stringWidth(trial, font, size) <= width:
+                line = trial
+            else:
+                if not line or pdfmetrics.stringWidth(word, font, size) > width:
+                    lines = []
+                    break
+                lines.append(line)
+                line = word
+        else:
+            if line:
+                lines.append(line)
+            if lines and len(lines) * size * 1.12 <= height:
+                pdf.setFont(font, size)
+                y = top - size - 1
+                for line in lines:
+                    pdf.drawString(left + 2, y, line)
+                    y -= size * 1.12
+                return
+    raise ValueError(f"Form text will not fit legibly in this field: {value[:60]}")
+
+
+def source_pdf(path):
+    path = Path(path)
+    if path.suffix.lower() == ".pdf":
+        return PdfReader(path)
+    from PIL import Image, ImageOps
+    image = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    stream = io.BytesIO()
+    image.save(stream, format="PDF", resolution=150)
+    stream.seek(0)
+    return PdfReader(stream)
+
+
+def field_rect(entry, widgets, page_number):
+    if isinstance(entry, str):
+        return widgets.get(entry)
+    if entry["page"] == page_number:
+        return entry["rect"]
+    return None
+
+
+def flatten_template(template, spec, values, selected, corrected=False):
+    reader = PdfReader(template)
+    writer = PdfWriter()
+    for page_number, source in enumerate(reader.pages):
+        page = writer.add_page(source)
+        stream = io.BytesIO()
+        pdf = canvas.Canvas(stream, pagesize=(float(page.mediabox.width), float(page.mediabox.height)))
+        widgets = {}
+        for reference in page.get("/Annots", []):
+            widget = reference.get_object()
+            name = widget.get("/T")
+            if name:
+                widgets[str(name)] = list(widget["/Rect"])
+        for key, field in spec["text"].items():
+            rect = field_rect(field, widgets, page_number)
+            if "mode.domestic" in selected and key in spec.get("overseas_only_text", []):
+                continue
+            if key in values and values[key] and rect:
+                draw_text(pdf, values[key], rect)
+        for key, field in spec["checkboxes"].items():
+            rect = field_rect(field, widgets, page_number)
+            if rect:
+                x0, y0, x1, y1 = map(float, rect)
+                pdf.setLineWidth(0.6)
+                pdf.rect(x0, y0, x1 - x0, y1 - y0)
+                if key in selected:
+                    pdf.setLineWidth(1)
+                    pdf.line(x0 + 1.5, y0 + 1.5, x1 - 1.5, y1 - 1.5)
+                    pdf.line(x0 + 1.5, y1 - 1.5, x1 - 1.5, y0 + 1.5)
+        if corrected and page_number == 0:
+            pdf.setFont(font_name(), 8)
+            pdf.drawString(36, 14, "UPDATED/CORRECTED from earlier submission")
+        pdf.showPage()
+        pdf.save()
+        if "/Annots" in page:
+            del page["/Annots"]
+        page.merge_page(PdfReader(stream).pages[0])
+    return writer
+
+
+def annotate_member(page, member_id):
+    stream = io.BytesIO()
+    width, height = float(page.mediabox.width), float(page.mediabox.height)
+    page.add_transformation(Transformation().translate(tx=0, ty=14))
+    page.mediabox.upper_right = (float(page.mediabox.right), float(page.mediabox.top) + 14)
+    page.cropbox = page.mediabox
+    pdf = canvas.Canvas(stream, pagesize=(width, height + 14))
+    pdf.setFont(font_name(), 7)
+    pdf.drawString(12, 3, "Member ID " + member_id)
+    pdf.save()
+    page.merge_page(PdfReader(stream).pages[0])
+
+
+def validate_claim(profile, claim, spec):
+    subscriber = required(profile, "subscriber")
+    for key in spec.get("required_subscriber", ["name", "member_id", "plan_name", "group_number"]):
+        required(subscriber, key)
+    if not (subscriber.get("phone") or subscriber.get("email")):
+        raise ValueError("Please provide the subscriber's phone number or email")
+    matches = [p for p in profile.get("patients", []) if p.get("id") == required(claim, "patient_id")]
+    if len(matches) != 1:
+        raise ValueError("Select exactly one patient from the household profile")
+    patient = matches[0]
+    required(patient, "name")
+    iso_date(required(patient, "dob"))
+    iso_date(required(claim, "date_of_service"))
+    country = str(required(claim, "service_country"))
+    domestic = {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA", "PUERTO RICO", "PR", "GUAM", "GU",
+                "US VIRGIN ISLANDS", "U.S. VIRGIN ISLANDS", "VI", "AMERICAN SAMOA", "AS", "NORTHERN MARIANA ISLANDS", "MP"}
+    mode = "domestic" if country.strip().upper() in domestic else "overseas"
+    provider = required(claim, "provider")
+    required(provider, "name")
+    required(provider, "address")
+    if mode == "domestic" and spec.get("requires_us_tax_id", True) and not re.fullmatch(r"\d{9}", str(provider.get("tax_id", ""))):
+        raise ValueError("Please provide the U.S. provider's nine-digit tax ID from its bill")
+    required(claim, "diagnosis")
+    amount = required(claim, "amount")
+    if money(required(amount, "total")) <= 0:
+        raise ValueError("Use the positive final invoice total after discounts")
+    services = required(claim, "services")
+    if not isinstance(services, list) or not services:
+        raise ValueError("Select the service types supported by the receipt")
+    for service in services:
+        if mode + "." + str(service) not in spec["checkboxes"]:
+            raise ValueError(f"Unsupported {mode} service type {service}. Use other with a description.")
+    if "other" in services:
+        required(claim, "description")
+    if claim.get("kind", "new") not in {"new", "correction"}:
+        raise ValueError("Use new or correction for the claim kind")
+    evidence = required(claim, "evidence")
+    if not any(e.get("role") == "receipt" for e in evidence):
+        raise ValueError("Please attach the itemized invoice or receipt")
+    if claim.get("kind") == "correction":
+        required(claim, "prior_claim_number")
+        if not any(e.get("role") == "prior_eob" for e in evidence):
+            raise ValueError("Please attach the prior EOB for the corrected claim")
+    for e in evidence:
+        if e.get("role") not in {"receipt", "certificate", "translation", "payment_proof", "prior_eob"}:
+            raise ValueError("Use a supported evidence role")
+        if not Path(required(e, "path")).is_file():
+            raise ValueError("An evidence file is unavailable: " + str(e["path"]))
+    if patient["dob"] > claim["date_of_service"]:
+        raise ValueError("The patient's birth date is later than the date of care")
+    return subscriber, patient, provider, mode
+
+
+def make_packet(profile, claim, output, progress=None):
+    """Create a flattened claim, evidence packet, email, tracker and portable progress."""
+    spec_file = Path(claim.get("template_spec", ROOT / "templates/geha.json")).resolve()
+    spec = json.loads(spec_file.read_text())
+    template = (spec_file.parent / spec["template"]).resolve()
+    if digest(template) != spec["sha256"]:
+        raise ValueError("The template changed. Inspect and update its field mapping before filling it.")
+    subscriber, patient, provider, mode = validate_claim(profile, claim, spec)
+    converted = convert(claim["amount"]["total"], claim["amount"]["currency"], claim["date_of_service"], claim.get("fx"))
+    dob = date.fromisoformat(patient["dob"])
+    service_date = date.fromisoformat(claim["date_of_service"])
+    values = {
+        "plan_name": subscriber.get("plan_name", ""), "group_number": subscriber.get("group_number", ""),
+        "subscriber": subscriber["name"], "member_id": subscriber["member_id"],
+        "patient": patient["name"], "contact": " / ".join(filter(None, [subscriber.get("phone"), subscriber.get("email")])),
+        "dob_month": dob.strftime("%m"), "dob_day": dob.strftime("%d"), "dob_year": dob.strftime("%Y"),
+        "date_month": service_date.strftime("%m"), "date_day": service_date.strftime("%d"), "date_year": service_date.strftime("%Y"),
+        "facility": provider.get("facility", provider["name"]), "provider": provider["name"],
+        "tax_id": provider.get("tax_id", "") if mode == "domestic" else "", "provider_address": provider["address"],
+        "country": claim["service_country"], "usd": converted["usd"], "diagnosis": claim["diagnosis"],
+        "description": claim.get("description", ""),
+    }
+    selected = {mode + "." + service for service in claim["services"]}
+    selected.add("payment." + claim.get("pay_to", "member"))
+    selected.add("mode." + mode)
+    if not selected.issubset(spec["checkboxes"]):
+        raise ValueError("Use member or provider for the payee")
+    mapped = {value for value in list(spec["text"].values()) + list(spec["checkboxes"].values()) if isinstance(value, str)}
+    if not mapped.issubset(PdfReader(template).get_fields() or {}):
+        raise ValueError("The template fields do not match the tested mapping")
+    corrected = claim.get("kind") == "correction"
+    writer = flatten_template(template, spec, values, selected, corrected)
+    seen = set()
+    evidence_manifest = []
+    priorities = {"receipt": 0, "certificate": 1, "translation": 2, "payment_proof": 3, "prior_eob": 4}
+    for e in sorted(claim["evidence"], key=lambda e: priorities[e["role"]]):
+        sha = digest(e["path"])
+        if sha in seen:
+            continue
+        seen.add(sha)
+        reader = source_pdf(e["path"])
+        start = len(writer.pages) + 1
+        for page in reader.pages:
+            saved_page = writer.add_page(page)
+            annotate_member(saved_page, subscriber["member_id"])
+        evidence_manifest.append({"file": Path(e["path"]).name, "role": e["role"], "sha256": sha, "pages": [start, len(writer.pages)]})
+    target = Path(output).resolve()
+    if target.exists():
+        raise ValueError("Choose a new output folder for this version")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".healthpdf-", dir=target.parent))
+    try:
+        with (stage / "claim-packet.pdf").open("wb") as f:
+            writer.write(f)
+        claim_id = str(claim.get("id") or hashlib.sha256(json.dumps(claim, sort_keys=True).encode()).hexdigest()[:16])
+        amount = str(money(claim["amount"]["total"]))
+        currency = claim["amount"]["currency"].upper()
+        opening = (f"I am resubmitting corrected information for claim {claim['prior_claim_number']}." if corrected
+                   else "Please process the attached medical claim.")
+        subject = ("Corrected claim " + claim["prior_claim_number"] if corrected else "Medical claim") + " - " + patient["name"] + " - " + claim["date_of_service"]
+        email = f"""To: {profile.get('insurer', {}).get('claim_email', spec['claim_email'])}
+Subject: {subject}
+
+Dear Claims Team,
+
+{opening} The patient is {patient['name']}, treated by {provider['name']} on {claim['date_of_service']}.
+
+The final charge is {amount} {currency}. The packet includes the completed claim form and supporting documents."""
+        if converted.get("method") == "documented USD payment":
+            email += f" The documented USD payment is ${converted['usd']}."
+        elif currency != "USD":
+            email += f" The USD equivalent shown is ${converted['usd']} using the recorded date-of-care conversion."
+        if corrected:
+            email += " The earlier EOB is included at the end for reference."
+        email += f"\n\nThank you,\n{subscriber['name']}\nMember ID {subscriber['member_id']}\n"
+        (stage / "email-draft.txt").write_text(email)
+        write_json(stage / "profile.json", profile)
+        tracker = {key: "" for key in TRACKER_COLUMNS}
+        tracker.update(claim_id=claim_id, patient=patient["name"], provider=provider["name"], service_date=claim["date_of_service"],
+                       country=claim["service_country"], currency=currency, original_amount=amount, submitted_usd=converted["usd"],
+                       fx_rate=converted["rate"], fx_date=converted["date"], fx_source=converted["source"], submission_status="prepared",
+                       provider_receipt="yes", payment_proof="yes" if any(e["role"] == "payment_proof" for e in evidence_manifest) else "unknown",
+                       hsa_reimbursed="no", notes="Review the completed PDF before submitting.")
+        previous = json.loads(json.dumps(progress or {}))
+        claims = previous.get("claims", [])
+        matches = [row for row in claims if row["claim_id"] == claim_id]
+        if len(matches) > 1:
+            raise ValueError("The saved progress contains duplicate claim IDs")
+        history = previous.get("history", [])
+        if matches:
+            history.append({"claim": matches[0], "replaced_by": claim_id})
+            old = matches[0]
+            for key in ("submitted_date", "insurer_claim_number", "eob_date", "insurer_paid_usd", "member_share_usd",
+                        "eob_saved", "insurer_deposit_verified", "hsa_reimbursed"):
+                tracker[key] = old.get(key, "")
+            if old.get("payment_proof") == "yes":
+                tracker["payment_proof"] = "yes"
+            tracker["notes"] = (old.get("notes", "") + " " + tracker["notes"]).strip()
+        if corrected:
+            tracker["insurer_claim_number"] = claim["prior_claim_number"]
+            tracker["submission_status"] = "correction_prepared"
+        claims = [row for row in claims if row["claim_id"] != claim_id] + [tracker]
+        save_tracker(stage / "tracker.csv", claims)
+        packets = previous.get("packets", [])
+        packets.append({"claim_id": claim_id, "packet_sha256": digest(stage / "claim-packet.pdf"),
+                        "evidence": evidence_manifest, "fx": converted, "visual_check": "pending"})
+        saved_progress = {**previous, "version": VERSION, "profile": profile, "claims": claims, "history": history,
+                          "packets": packets}
+        write_json(stage / "progress.json", saved_progress)
+        (stage / "review.txt").write_text(
+            "Open claim-packet.pdf and check patient, date, provider, amounts, checkboxes and evidence pages.\n"
+            "The assistant must render and inspect the form before calling the packet ready to submit.\n"
+            "Report submitted only after you confirm sending. Keep progress.json privately for the next conversation.\n"
+        )
+        stage.rename(target)
+    except BaseException:
+        shutil.rmtree(stage)
+        raise
+    return {"folder": str(target), "claim_id": claim_id, "packet": str(target / "claim-packet.pdf"), "fx": converted}
+
+
+def save_tracker(path, rows):
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRACKER_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def reconcile(tracker, eob):
+    """Bind an EOB to an exact local claim ID, preserving independent proof facts."""
+    with Path(tracker).open(newline="") as source:
+        rows = list(csv.DictReader(source))
+    matches = [r for r in rows if r["claim_id"] == required(eob, "claim_id")]
+    if len(matches) != 1:
+        raise ValueError("Match the EOB to exactly one claim in the tracker")
+    row = matches[0]
+    if row["patient"] != required(eob, "patient") or row["service_date"] != iso_date(required(eob, "service_date")):
+        raise ValueError("EOB patient or service date conflicts with this claim")
+    if eob.get("provider") and row["provider"] != eob["provider"]:
+        raise ValueError("EOB provider differs. Confirm its documented billing alias before matching.")
+    paid = money(required(eob, "paid_usd"))
+    member = money(required(eob, "member_share_usd"))
+    billed = money(required(eob, "billed_usd"))
+    discounts = money(eob.get("discount_usd", "0"))
+    if paid + member + discounts != billed:
+        raise ValueError("The EOB totals need review before updating this claim")
+    status = required(eob, "status")
+    if status not in {"paid", "partially_paid", "denied", "needs_information"}:
+        raise ValueError("Use the documented EOB disposition")
+    claim_number = str(required(eob, "insurer_claim_number"))
+    notice = iso_date(required(eob, "notice_date"))
+    eob_file = Path(required(eob, "path"))
+    if not eob_file.is_file():
+        raise ValueError("Keep the EOB PDF with the claim before marking it saved")
+    fingerprint = digest(eob_file)
+    entry = f"EOB {claim_number} dated {notice}, SHA256 {fingerprint}. " + str(eob.get("reason", ""))
+    if entry not in row.get("notes", ""):
+        row["notes"] = (row.get("notes", "") + " " + entry).strip()
+    row.update(insurer_claim_number=claim_number, eob_date=notice, insurer_paid_usd=str(paid),
+               member_share_usd=str(member), eob_saved="yes", submission_status=status)
+    return rows
+
+
+def save_reconciled_progress(path, rows, eob, previous=None):
+    progress = json.loads(json.dumps(previous or {}))
+    progress.update(version=VERSION, claims=rows)
+    events = progress.setdefault("eobs", [])
+    record = {**eob, "path": Path(eob["path"]).name, "sha256": digest(eob["path"])}
+    if not any(event.get("sha256") == record["sha256"] and event.get("claim_id") == record["claim_id"] for event in events):
+        events.append(record)
+    write_json(path, progress)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    p = commands.add_parser("inventory")
+    p.add_argument("files", nargs="+")
+    p = commands.add_parser("convert")
+    p.add_argument("amount")
+    p.add_argument("currency")
+    p.add_argument("date")
+    p = commands.add_parser("prepare")
+    p.add_argument("--profile", required=True)
+    p.add_argument("--claim", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--progress", help="Saved progress.json from an earlier batch")
+    p = commands.add_parser("reconcile")
+    p.add_argument("--tracker", required=True)
+    p.add_argument("--eob", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--progress", help="Existing progress.json to retain all claim history")
+    args = parser.parse_args()
+    try:
+        if args.command == "inventory":
+            result = inventory(args.files)
+        elif args.command == "convert":
+            result = convert(args.amount, args.currency, args.date)
+        elif args.command == "prepare":
+            result = make_packet(json.loads(Path(args.profile).read_text()), json.loads(Path(args.claim).read_text()), args.out,
+                                 json.loads(Path(args.progress).read_text()) if args.progress else None)
+        else:
+            eob = json.loads(Path(args.eob).read_text())
+            result = reconcile(args.tracker, eob)
+            progress_file = Path(args.out).with_suffix(".progress.json")
+            if Path(args.out).exists() or progress_file.exists():
+                raise ValueError("Choose a new tracker filename for this revision")
+            save_tracker(args.out, result)
+            previous = json.loads(Path(args.progress).read_text()) if args.progress else None
+            save_reconciled_progress(progress_file, result, eob, previous)
+            result = {"tracker": args.out, "progress": str(progress_file), "records": len(result)}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    except (ValueError, KeyError, OSError) as error:
+        parser.exit(2, str(error) + "\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+{
+  "subscriber": {
+    "name": "",
+    "member_id": "",
+    "group_number": "",
+    "plan_name": "",
+    "address": "",
+    "email": "",
+    "phone": ""
+  },
+  "patients": [
+    {
+      "id": "patient-1",
+      "name": "",
+      "dob": "",
+      "relationship": ""
+    }
+  ],
+  "insurer": {
+    "name": "GEHA",
+    "claim_email": "GEHA-ClaimSubmission@mygeha.com"
+  },
+  "other_insurance": ""
+}

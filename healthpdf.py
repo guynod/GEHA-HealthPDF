@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from pypdf import PdfReader, PdfWriter, Transformation
+from pypdf.generic import ArrayObject, DecodedStreamObject, DictionaryObject, NameObject, StreamObject
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
@@ -27,7 +28,7 @@ import reportlab
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 CENT = Decimal("0.01")
 FOOTER_HEIGHT = 14
 # ISO 4217 exceptions to two minor-unit decimal places. SIX List One, published
@@ -273,11 +274,75 @@ def flatten_template(template, spec, values, selected, corrected=False):
     return writer
 
 
+def flatten_evidence_widgets(page):
+    """Paint existing field appearances into a writer-owned page, then remove widgets."""
+    widgets = [ref.get_object() for ref in page.get("/Annots", [])
+               if ref.get_object().get("/Subtype") == "/Widget"]
+    if not widgets:
+        return
+    fallback = ("An evidence form field cannot be made static without changing its appearance. "
+                "The assistant should render a copy to a static PDF and visually check it; keep the original unchanged.")
+    resources = page.setdefault(NameObject("/Resources"), DictionaryObject()).get_object()
+    resources.setdefault(NameObject("/XObject"), DictionaryObject())
+    xobjects = resources["/XObject"]
+    commands = []
+    for widget in widgets:
+        flags = int(widget.get("/F", 0))
+        if flags & 35:  # Invisible, Hidden and NoView fields are not displayed evidence.
+            continue
+        if flags & 16 and page.rotation:  # NoRotate needs the viewer's annotation layout.
+            raise ValueError(fallback)
+        appearance = widget.get("/AP")
+        appearance = appearance.get_object() if appearance is not None else None
+        if not isinstance(appearance, DictionaryObject):
+            raise ValueError(fallback)
+        normal = appearance.get("/N")
+        normal = normal.get_object() if normal is not None else None
+        if isinstance(normal, DictionaryObject) and not isinstance(normal, StreamObject):
+            state, parent = widget.get("/AS"), widget
+            while state is None and parent is not None:
+                state = parent.get("/V")
+                parent = parent["/Parent"] if "/Parent" in parent else None
+            normal = normal.get(state or "/Off")
+            normal = normal.get_object() if normal is not None else None
+        if not isinstance(normal, StreamObject) or getattr(normal, "indirect_reference", None) is None or "/BBox" not in normal:
+            raise ValueError(fallback)
+        left, bottom, right, top = map(float, widget["/Rect"])
+        bx0, by0, bx1, by1 = map(float, normal["/BBox"])
+        matrix = Transformation(tuple(map(float, normal.get("/Matrix", (1, 0, 0, 1, 0, 0)))))
+        corners = [matrix.apply_on(point) for point in ((bx0, by0), (bx0, by1), (bx1, by0), (bx1, by1))]
+        x0, y0 = min(p[0] for p in corners), min(p[1] for p in corners)
+        x1, y1 = max(p[0] for p in corners), max(p[1] for p in corners)
+        if not all(isfinite(v) for v in (left, bottom, right, top, x0, y0, x1, y1)) or right <= left or top <= bottom or x1 <= x0 or y1 <= y0:
+            raise ValueError(fallback)
+        sx, sy = (right - left) / (x1 - x0), (top - bottom) / (y1 - y0)
+        transform = (sx, 0, 0, sy, left - sx * x0, bottom - sy * y0)
+        if not all(isfinite(v) for v in transform):
+            raise ValueError(fallback)
+        name = "/HealthPDFField" + str(len(xobjects))
+        while name in xobjects:
+            name += "_"
+        xobjects[NameObject(name)] = normal.indirect_reference
+        coordinates = " ".join(f"{v:.10f}".rstrip("0").rstrip(".") or "0" for v in transform)
+        commands.append(f"q\n{coordinates} cm\n{name} Do\nQ\n".encode("ascii"))
+    if commands:
+        original = page.get_contents()
+        stream = DecodedStreamObject()
+        stream.set_data(b"q\n" + (original.get_data() if original is not None else b"") + b"\nQ\n" + b"".join(commands))
+        page.replace_contents(stream.flate_encode())
+    remaining = [ref for ref in page.get("/Annots", []) if ref.get_object().get("/Subtype") != "/Widget"]
+    if remaining:
+        page[NameObject("/Annots")] = ArrayObject(remaining)
+    else:
+        del page["/Annots"]
+
+
 def annotate_member(page, member_id):
     """Keep the displayed crop/orientation and add an upright footer outside it."""
     # Work on writer-owned copies so rotation/merging cannot alter the source reader.
     working = PdfWriter()
     source = working.add_page(page)
+    flatten_evidence_widgets(source)
     if source.rotation:
         source.transfer_rotation_to_content()
     left, bottom, right, top = map(float, source.cropbox)

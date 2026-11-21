@@ -11,7 +11,7 @@ from unittest import mock
 
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter, Transformation
-from pypdf.generic import RectangleObject, NumberObject, NameObject
+from pypdf.generic import RectangleObject, NumberObject, NameObject, ArrayObject, FloatObject
 from reportlab.pdfgen import canvas
 
 import healthpdf
@@ -249,6 +249,31 @@ class ClaimTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             healthpdf.reconcile(self.root / "duplicates.csv", eob)
 
+    def test_fillable_receipt_is_static_in_the_complete_packet(self):
+        form = self.root / "filled-receipt.pdf"
+        pdf = canvas.Canvas(str(form), pagesize=(612, 792))
+        pdf.drawString(36, 730, "FICTIONAL RECEIPT - DO NOT SUBMIT")
+        pdf.acroForm.textfield(name="total", value="THB 4,300.00", x=36, y=630, width=200, height=30, fontSize=14)
+        pdf.acroForm.checkbox(name="paid", checked=True, x=36, y=580)
+        pdf.save()
+        original = PdfReader(form)
+        checked = original.pages[0]["/Annots"][1].get_object()
+        checked_stream = checked["/AP"]["/N"][checked["/AS"]].get_data()
+        before = healthpdf.digest(form)
+        claim = copy.deepcopy(self.claim)
+        claim.update(service_country="Thailand", amount={"total": "4300.00", "currency": "THB"},
+                     fx={"actual_usd": "127.41", "date": "2026-10-01", "source": "Fictional payment"},
+                     evidence=[{"path": str(form), "role": "receipt"}])
+        result = self.prepare(claim)
+        packet = PdfReader(result["packet"])
+        self.assertFalse(packet.get_fields())
+        self.assertFalse(any(ref.get_object().get("/Subtype") == "/Widget"
+                             for page in packet.pages for ref in page.get("/Annots", [])))
+        self.assertIn("THB 4,300.00", packet.pages[-1].extract_text())
+        appearances = packet.pages[-1]["/Resources"]["/XObject"].values()
+        self.assertIn(checked_stream, [ref.get_object().get_data() for ref in appearances])
+        self.assertEqual(healthpdf.digest(form), before)
+
 
 class EvidencePageTests(unittest.TestCase):
     def setUp(self):
@@ -262,6 +287,16 @@ class EvidencePageTests(unittest.TestCase):
         stream = io.BytesIO()
         pdf = canvas.Canvas(stream, pagesize=(200, 300))
         pdf.drawString(20, 25, "VISIBLE BOTTOM")
+        pdf.save()
+        stream.seek(0)
+        return PdfWriter().add_page(PdfReader(stream).pages[0])
+
+    def form_page(self):
+        stream = io.BytesIO()
+        pdf = canvas.Canvas(stream, pagesize=(240, 340))
+        pdf.drawString(25, 300, "FICTIONAL FILLABLE RECEIPT")
+        pdf.acroForm.textfield(name="total", value="THB 4,300.00", x=40, y=200, width=140, height=24, fontSize=12)
+        pdf.acroForm.checkbox(name="paid", checked=True, x=40, y=160)
         pdf.save()
         stream.seek(0)
         return PdfWriter().add_page(PdfReader(stream).pages[0])
@@ -338,6 +373,56 @@ class EvidencePageTests(unittest.TestCase):
             self.assertAlmostEqual(float(output.mediabox.width), width)
             self.assertAlmostEqual(float(output.mediabox.height), height + 14)
             self.assert_footer(output)
+
+    def test_field_appearance_survives_matrix_offset_crop_and_rotation(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                page = self.form_page()
+                writer = page.indirect_reference.pdf
+                for reference in page["/Annots"]:
+                    widget = reference.get_object()
+                    x0, y0, x1, y1 = map(float, widget["/Rect"])
+                    widget[NameObject("/Rect")] = RectangleObject((x0 + 100, y0 - 50, x1 + 100, y1 - 50))
+                    # /AP can itself be indirect in an ordinary valid PDF.
+                    widget[NameObject("/AP")] = writer._add_object(widget["/AP"])
+                appearance = page["/Annots"][0].get_object()["/AP"]["/N"]
+                appearance[NameObject("/Matrix")] = ArrayObject([FloatObject(v) for v in (2, 0, 0, 3, 17, -9)])
+                page.add_transformation(Transformation().translate(tx=100, ty=-50))
+                page.mediabox = RectangleObject((100, -50, 340, 290))
+                page.cropbox = RectangleObject((120, -30, 320, 270))
+                page.rotate(rotation)
+                original_bytes = page.get_contents().get_data()
+                output = healthpdf.annotate_member(page, "DEMO-0000")
+                self.assertIn("THB 4,300.00", output.extract_text())
+                self.assertFalse(output.get("/Annots"))
+                self.assert_footer(output)
+                self.assertEqual(page.rotation, rotation)
+                self.assertEqual(page.get_contents().get_data(), original_bytes)
+                self.assertEqual(len(page["/Annots"]), 2)
+                self.assertEqual(list(page.cropbox), [120, -30, 320, 270])
+
+    def test_missing_field_appearance_fails_without_removing_original_fields(self):
+        page = self.form_page()
+        widget = page["/Annots"][0].get_object()
+        del widget["/AP"]
+        with self.assertRaisesRegex(ValueError, "render a copy to a static PDF"):
+            healthpdf.annotate_member(page, "DEMO-0000")
+        self.assertEqual(widget["/V"], "THB 4,300.00")
+        self.assertEqual(len(page["/Annots"]), 2)
+
+    def test_hidden_fields_stay_hidden_and_no_rotate_requires_rendered_copy(self):
+        for flags in (1, 2, 32):
+            with self.subTest(flags=flags):
+                page = self.form_page()
+                page["/Annots"][0].get_object()[NameObject("/F")] = NumberObject(flags)
+                output = healthpdf.annotate_member(page, "DEMO-0000")
+                self.assertNotIn("THB 4,300.00", output.extract_text())
+                self.assertFalse(output.get("/Annots"))
+        page = self.form_page()
+        page["/Annots"][0].get_object()[NameObject("/F")] = NumberObject(16)
+        page.rotate(90)
+        with self.assertRaisesRegex(ValueError, "render a copy"):
+            healthpdf.annotate_member(page, "DEMO-0000")
 
 
 if __name__ == "__main__":

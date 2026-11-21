@@ -1,22 +1,28 @@
 # HealthPDF
 
-Prepare insurance claim packets and reconcile EOBs in ChatGPT, Gemini, or Claude. Start with receipts and download a completed PDF, an email draft, and a simple claims tracker.
+HealthPDF helps your AI chatbot prepare GEHA insurance claims from your receipts and invoices. **You do not need GitHub, Codex, or programming knowledge—just your usual AI chatbot.**
 
-## Start in three steps
+## Start here
 
-1. Download and unzip `healthpdf-starter.zip` from this repository.
-2. Start a new conversation in your preferred assistant. Attach the starter ZIP and your receipts. If the assistant cannot open the ZIP, attach its individual files instead.
-3. Paste this message.
+1. [Download the HealthPDF starter kit](https://github.com/guynod/GEHA-HealthPDF/raw/refs/heads/main/healthpdf-starter.zip).
+2. Start a new conversation in **ChatGPT, Gemini, or Claude**.
+3. Attach the downloaded ZIP and your medical receipts or invoices.
+4. Copy and paste this message:
 
 ```text
 Use the attached HealthPDF kit. Read START-HERE.md and ASSISTANT-GUIDE.md,
-then help me prepare these claims. Ask for my household and insurance details
-once, using information already present in my documents. Complete routine
-calculations, currency conversion, PDF preparation, and tracker updates without
-asking me to approve each step. Give me the finished packet and email to review.
+then prepare my insurance claim. Get information from my documents first
+and ask me together for anything missing. Infer the service country and
+currency from the invoice, handle currency conversion, and give me a
+completed claim PDF, an email draft, and the tracking files to save for
+next time.
 ```
 
-Your assistant will ask for the subscriber and patient details needed by the form. After the first claim, save the downloaded `profile.json`, `progress.json`, and `tracker.csv` privately. Upload them with the next batch to continue.
+The chatbot will ask for your insurance and household details when needed. Check the completed claim before submitting it yourself.
+
+If it cannot open the ZIP, unzip it and attach the files inside. If it cannot create downloadable PDFs, you’ll need a chatbot version that supports file creation.
+
+Keep your completed files privately for your next claim. Never upload personal medical or insurance information to this GitHub repository.
 
 For app settings and troubleshooting, see [assistant setup](docs/assistant-setup.md).
 

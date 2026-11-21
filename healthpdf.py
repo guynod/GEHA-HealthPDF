@@ -28,9 +28,13 @@ import reportlab
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 CENT = Decimal("0.01")
 FOOTER_HEIGHT = 14
+STATIC_EVIDENCE_FALLBACK = (
+    "An evidence form field cannot be made static without changing its appearance. "
+    "The assistant should render a copy to a static PDF and visually check it; keep the original unchanged."
+)
 # ISO 4217 exceptions to two minor-unit decimal places. SIX List One, published
 # 2026-09-17, verified 2026-11-21. USD output and EOB amounts remain cent-limited.
 # https://www.six-group.com/dam/download/financial-information/data-center/iso-currrency/lists/list-one.xml
@@ -186,10 +190,22 @@ def draw_text(pdf, value, rect):
 
 
 def source_pdf(path):
-    """Fit photo evidence on a Letter page, reserving space for its member footer."""
+    """Check source form settings before copying pages; fit photos on Letter pages."""
     path = Path(path)
     if path.suffix.lower() == ".pdf":
-        return PdfReader(path)
+        reader = PdfReader(path)
+        form = reader.trailer["/Root"].get("/AcroForm")
+        form = form.get_object() if form is not None else None
+        if isinstance(form, DictionaryObject):
+            flag = form.get("/NeedAppearances", False)
+            flag = flag.get_object() if hasattr(flag, "get_object") else flag
+            # BooleanObject(False) is truthy as a Python object: use its stored value.
+            if getattr(flag, "value", flag) and any(
+                ref.get_object().get("/Subtype") == "/Widget"
+                for page in reader.pages for ref in (page["/Annots"] if "/Annots" in page else [])
+            ):
+                raise ValueError("This evidence PDF needs its form fields redrawn. " + STATIC_EVIDENCE_FALLBACK)
+        return reader
     from PIL import Image, ImageOps
     try:
         from pillow_heif import register_heif_opener
@@ -280,8 +296,7 @@ def flatten_evidence_widgets(page):
                if ref.get_object().get("/Subtype") == "/Widget"]
     if not widgets:
         return
-    fallback = ("An evidence form field cannot be made static without changing its appearance. "
-                "The assistant should render a copy to a static PDF and visually check it; keep the original unchanged.")
+    fallback = STATIC_EVIDENCE_FALLBACK
     resources = page.setdefault(NameObject("/Resources"), DictionaryObject()).get_object()
     resources.setdefault(NameObject("/XObject"), DictionaryObject())
     xobjects = resources["/XObject"]

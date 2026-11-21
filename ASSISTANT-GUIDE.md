@@ -18,6 +18,8 @@ Phone photos, including HEIC/HEIF, are supported by the helper. Install the supp
 
 Generated evidence pages must have static form fields. The helper paints existing field appearances, including receipt totals and checked boxes, into the page before removing the editable widgets. If a visible field lacks a usable appearance, render a copy with the assistant's PDF tools and visually verify all field values before using it. Never remove an editable field before preserving its displayed content, and keep the uploaded original unchanged.
 
+The helper checks the original PDF's form settings before copying pages. If `/NeedAppearances` is true and any page has form fields, it refuses to flatten cached appearances because they may show an outdated amount. Use the same rendered-copy fallback and check the current field values against the rendered copy; do not clear that flag merely to bypass the check.
+
 Group evidence by patient, provider, service date, invoice number, and existing claim number. Read every document supplied for an expense before asking for a charge amount. Use the final net charge after discounts. A quotation, certificate, or unit price alone may not establish the amount paid.
 
 Keep the service date, invoice date, payment date, and EOB date distinct. Use documented services and diagnosis or the user’s stated reason for care. Preserve the provider’s specificity. Ask about a missing required diagnosis or care date instead of inventing one. Use an English translation or transliteration alongside the original evidence when needed.

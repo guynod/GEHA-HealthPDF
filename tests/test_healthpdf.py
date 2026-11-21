@@ -11,7 +11,7 @@ from unittest import mock
 
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter, Transformation
-from pypdf.generic import RectangleObject, NumberObject, NameObject, ArrayObject, FloatObject
+from pypdf.generic import RectangleObject, NumberObject, NameObject, ArrayObject, FloatObject, BooleanObject, TextStringObject, DictionaryObject
 from reportlab.pdfgen import canvas
 
 import healthpdf
@@ -273,6 +273,59 @@ class ClaimTests(unittest.TestCase):
         appearances = packet.pages[-1]["/Resources"]["/XObject"].values()
         self.assertIn(checked_stream, [ref.get_object().get_data() for ref in appearances])
         self.assertEqual(healthpdf.digest(form), before)
+
+    def test_stale_need_appearances_receipt_is_rejected_before_output(self):
+        for indirect_flag in (False, True):
+            for cover in (False, True):
+                with self.subTest(indirect_flag=indirect_flag, cover=cover):
+                    stream = io.BytesIO()
+                    pdf = canvas.Canvas(stream, pagesize=(612, 792))
+                    pdf.drawString(36, 730, "FICTIONAL STALE-FIELD RECEIPT")
+                    pdf.acroForm.textfield(name="total", value="THB 4,300.00", x=36, y=630, width=200, height=30, fontSize=14)
+                    pdf.save()
+                    stream.seek(0)
+                    writer = PdfWriter(clone_from=PdfReader(stream))
+                    widget = writer.pages[0]["/Annots"][0].get_object()
+                    widget[NameObject("/V")] = TextStringObject("THB 9,999.00")
+                    self.assertIn(b"4,300.00", widget["/AP"]["/N"].get_data())
+                    flag = BooleanObject(True)
+                    writer._root_object["/AcroForm"][NameObject("/NeedAppearances")] = writer._add_object(flag) if indirect_flag else flag
+                    if cover:
+                        writer.insert_blank_page(width=612, height=792, index=0)
+                    path = self.root / f"stale-{indirect_flag}-{cover}.pdf"
+                    with path.open("wb") as out:
+                        writer.write(out)
+                    before = healthpdf.digest(path)
+                    claim = copy.deepcopy(self.claim)
+                    claim["evidence"] = [{"path": str(path), "role": "receipt"}]
+                    folder = f"refused-{indirect_flag}-{cover}"
+                    with self.assertRaisesRegex(ValueError, "render a copy to a static PDF"):
+                        self.prepare(claim, folder)
+                    self.assertFalse((self.root / folder).exists())
+                    self.assertEqual(healthpdf.digest(path), before)
+
+    def test_false_need_appearances_and_fieldless_pdf_remain_accepted(self):
+        for widgets, need_appearances in ((True, False), (False, True)):
+            with self.subTest(widgets=widgets, need_appearances=need_appearances):
+                stream = io.BytesIO()
+                pdf = canvas.Canvas(stream, pagesize=(612, 792))
+                pdf.drawString(36, 730, "FICTIONAL RECEIPT")
+                if widgets:
+                    pdf.acroForm.textfield(name="total", value="THB 4,300.00", x=36, y=630, width=200, height=30)
+                pdf.save()
+                stream.seek(0)
+                writer = PdfWriter(clone_from=PdfReader(stream))
+                if "/AcroForm" not in writer._root_object:
+                    writer._root_object[NameObject("/AcroForm")] = DictionaryObject()
+                writer._root_object["/AcroForm"][NameObject("/NeedAppearances")] = BooleanObject(need_appearances)
+                path = self.root / f"accepted-{widgets}.pdf"
+                with path.open("wb") as out:
+                    writer.write(out)
+                reader = healthpdf.source_pdf(path)
+                output = healthpdf.annotate_member(reader.pages[0], "DEMO-0000")
+                self.assertIn("FICTIONAL RECEIPT", output.extract_text())
+                if widgets:
+                    self.assertIn("THB 4,300.00", output.extract_text())
 
 
 class EvidencePageTests(unittest.TestCase):

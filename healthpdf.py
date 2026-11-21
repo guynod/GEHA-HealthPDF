@@ -10,8 +10,10 @@ import json
 import re
 import shutil
 import tempfile
+import unicodedata
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from math import isfinite
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -20,12 +22,22 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 import reportlab
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CENT = Decimal("0.01")
+FOOTER_HEIGHT = 14
+# ISO 4217 exceptions to two minor-unit decimal places. SIX List One, published
+# 2026-09-17, verified 2026-11-21. USD output and EOB amounts remain cent-limited.
+# https://www.six-group.com/dam/download/financial-information/data-center/iso-currrency/lists/list-one.xml
+CURRENCY_MINOR_UNITS = {
+    **dict.fromkeys("BIF CLP DJF GNF ISK JPY KMF KRW PYG RWF UGX UYI VND VUV XAF XOF XPF".split(), 0),
+    **dict.fromkeys("BHD IQD JOD KWD LYD OMR TND".split(), 3),
+    **dict.fromkeys("CLF UYW".split(), 4),
+}
 TRACKER_COLUMNS = [
     "claim_id", "patient", "provider", "service_date", "country", "currency",
     "original_amount", "submitted_usd", "fx_rate", "fx_date", "fx_source",
@@ -35,14 +47,20 @@ TRACKER_COLUMNS = [
 ]
 
 
-def money(value):
-    """Accept exact cents, with an explicit error for malformed or negative money."""
+def money(value, currency="USD"):
+    """Preserve the original amount, validating its currency's minor-unit precision."""
+    currency = str(currency).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("Use a three-letter currency code")
+    places = CURRENCY_MINOR_UNITS.get(currency, 2)
+    quantum = Decimal(1).scaleb(-places)
     try:
         number = Decimal(str(value))
+        valid = number.is_finite() and number >= 0 and number == number.quantize(quantum)
     except InvalidOperation as error:
         raise ValueError("Amount must be a number") from error
-    if not number.is_finite() or number < 0 or number != number.quantize(CENT):
-        raise ValueError("Amount must be nonnegative and have at most two decimal places")
+    if not valid:
+        raise ValueError(f"Amount must be nonnegative and have at most {places} decimal places for {currency}")
     return number
 
 
@@ -87,13 +105,13 @@ def inventory(paths):
 
 def convert(amount, currency, service_date, fx=None):
     """Use supplied source-bound FX or look up date/currency metadata automatically."""
-    amount = money(amount)
-    currency = str(currency).upper()
+    currency = str(currency).strip().upper()
+    amount = money(amount, currency)
     requested = iso_date(service_date)
     if not re.fullmatch(r"[A-Z]{3}", currency):
         raise ValueError("Use a three-letter currency code")
     if currency == "USD":
-        return {"usd": str(amount), "rate": "1", "date": requested, "source": "USD invoice"}
+        return {"usd": str(amount.quantize(CENT)), "rate": "1", "date": requested, "source": "USD invoice"}
     if fx and "actual_usd" in fx:
         usd = money(fx["actual_usd"])
         if usd <= 0 or amount <= 0:
@@ -167,13 +185,42 @@ def draw_text(pdf, value, rect):
 
 
 def source_pdf(path):
+    """Fit photo evidence on a Letter page, reserving space for its member footer."""
     path = Path(path)
     if path.suffix.lower() == ".pdf":
         return PdfReader(path)
     from PIL import Image, ImageOps
-    image = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    try:
+        from pillow_heif import register_heif_opener
+    except ImportError as error:
+        if path.suffix.lower() in {".heic", ".heif", ".hif", ".heics", ".heifs"}:
+            raise ValueError(
+                "HEIC photos need pillow-heif. The assistant can install requirements.txt, "
+                "or convert a copy to JPEG or PNG and keep the original unchanged."
+            ) from error
+    else:
+        register_heif_opener(thumbnails=False)
+    with Image.open(path) as source:
+        oriented = ImageOps.exif_transpose(source)
+        if "A" in oriented.getbands() or "transparency" in oriented.info:
+            rgba = oriented.convert("RGBA")
+            image = Image.new("RGB", rgba.size, "white")
+            image.paste(rgba, mask=rgba.getchannel("A"))
+        else:
+            image = oriented.convert("RGB")
+        image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+    photo = io.BytesIO()
+    image.save(photo, format="JPEG", quality=95, optimize=True)
+    photo.seek(0)
+    width, height = 612, 792 - FOOTER_HEIGHT
+    margin = 18
+    scale = min((width - 2 * margin) / image.width, (height - 2 * margin) / image.height)
+    drawn_width, drawn_height = image.width * scale, image.height * scale
     stream = io.BytesIO()
-    image.save(stream, format="PDF", resolution=150)
+    pdf = canvas.Canvas(stream, pagesize=(width, height))
+    pdf.drawImage(ImageReader(photo), (width - drawn_width) / 2, (height - drawn_height) / 2,
+                  width=drawn_width, height=drawn_height)
+    pdf.save()
     stream.seek(0)
     return PdfReader(stream)
 
@@ -227,16 +274,28 @@ def flatten_template(template, spec, values, selected, corrected=False):
 
 
 def annotate_member(page, member_id):
+    """Keep the displayed crop/orientation and add an upright footer outside it."""
+    # Work on writer-owned copies so rotation/merging cannot alter the source reader.
+    working = PdfWriter()
+    source = working.add_page(page)
+    if source.rotation:
+        source.transfer_rotation_to_content()
+    left, bottom, right, top = map(float, source.cropbox)
+    unit = float(source.user_unit)
+    if not all(isfinite(v) for v in (left, bottom, right, top, unit)) or right <= left or top <= bottom or unit <= 0:
+        raise ValueError("The evidence page has invalid visible page bounds")
+    width, height = (right - left) * unit, (top - bottom) * unit
+    output = working.add_blank_page(width=width, height=height + FOOTER_HEIGHT)
+    output.merge_transformed_page(
+        source, Transformation().scale(sx=unit, sy=unit).translate(tx=-left * unit, ty=FOOTER_HEIGHT - bottom * unit)
+    )
     stream = io.BytesIO()
-    width, height = float(page.mediabox.width), float(page.mediabox.height)
-    page.add_transformation(Transformation().translate(tx=0, ty=14))
-    page.mediabox.upper_right = (float(page.mediabox.right), float(page.mediabox.top) + 14)
-    page.cropbox = page.mediabox
-    pdf = canvas.Canvas(stream, pagesize=(width, height + 14))
+    pdf = canvas.Canvas(stream, pagesize=(width, height + FOOTER_HEIGHT))
     pdf.setFont(font_name(), 7)
     pdf.drawString(12, 3, "Member ID " + member_id)
     pdf.save()
-    page.merge_page(PdfReader(stream).pages[0])
+    output.merge_page(PdfReader(stream).pages[0])
+    return output
 
 
 def validate_claim(profile, claim, spec):
@@ -263,7 +322,7 @@ def validate_claim(profile, claim, spec):
         raise ValueError("Please provide the U.S. provider's nine-digit tax ID from its bill")
     required(claim, "diagnosis")
     amount = required(claim, "amount")
-    if money(required(amount, "total")) <= 0:
+    if money(required(amount, "total"), required(amount, "currency")) <= 0:
         raise ValueError("Use the positive final invoice total after discounts")
     services = required(claim, "services")
     if not isinstance(services, list) or not services:
@@ -335,8 +394,7 @@ def make_packet(profile, claim, output, progress=None):
         reader = source_pdf(e["path"])
         start = len(writer.pages) + 1
         for page in reader.pages:
-            saved_page = writer.add_page(page)
-            annotate_member(saved_page, subscriber["member_id"])
+            writer.add_page(annotate_member(page, subscriber["member_id"]))
         evidence_manifest.append({"file": Path(e["path"]).name, "role": e["role"], "sha256": sha, "pages": [start, len(writer.pages)]})
     target = Path(output).resolve()
     if target.exists():
@@ -347,8 +405,8 @@ def make_packet(profile, claim, output, progress=None):
         with (stage / "claim-packet.pdf").open("wb") as f:
             writer.write(f)
         claim_id = str(claim.get("id") or hashlib.sha256(json.dumps(claim, sort_keys=True).encode()).hexdigest()[:16])
-        amount = str(money(claim["amount"]["total"]))
-        currency = claim["amount"]["currency"].upper()
+        currency = claim["amount"]["currency"].strip().upper()
+        amount = str(money(claim["amount"]["total"], currency))
         opening = (f"I am resubmitting corrected information for claim {claim['prior_claim_number']}." if corrected
                    else "Please process the attached medical claim.")
         subject = ("Corrected claim " + claim["prior_claim_number"] if corrected else "Medical claim") + " - " + patient["name"] + " - " + claim["date_of_service"]
@@ -420,6 +478,15 @@ def save_tracker(path, rows):
         writer.writerows(rows)
 
 
+def normalized_patient_name(value):
+    """Normalize presentation only; never guess initials, omit names or use fuzzy matching."""
+    value = unicodedata.normalize("NFKC", str(value)).casefold()
+    parts = value.split(",")
+    if len(parts) == 2 and all(part.strip() for part in parts):
+        value = parts[1] + " " + parts[0]
+    return " ".join(value.split())
+
+
 def reconcile(tracker, eob):
     """Bind an EOB to an exact local claim ID, preserving independent proof facts."""
     with Path(tracker).open(newline="") as source:
@@ -428,7 +495,8 @@ def reconcile(tracker, eob):
     if len(matches) != 1:
         raise ValueError("Match the EOB to exactly one claim in the tracker")
     row = matches[0]
-    if row["patient"] != required(eob, "patient") or row["service_date"] != iso_date(required(eob, "service_date")):
+    if (normalized_patient_name(row["patient"]) != normalized_patient_name(required(eob, "patient"))
+            or row["service_date"] != iso_date(required(eob, "service_date"))):
         raise ValueError("EOB patient or service date conflicts with this claim")
     if eob.get("provider") and row["provider"] != eob["provider"]:
         raise ValueError("EOB provider differs. Confirm its documented billing alias before matching.")

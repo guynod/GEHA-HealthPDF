@@ -28,6 +28,8 @@ For app settings and troubleshooting, see [assistant setup](docs/assistant-setup
 
 ## What you receive
 
+Upload PDFs or phone photos, including JPEG, PNG, and iPhone HEIC/HEIF files. HealthPDF prepares readable Letter-sized photo pages while keeping your originals unchanged.
+
 - A completed claim form with the receipts and supporting documents attached.
 - A short email draft ready for your review and manual submission.
 - A CSV tracker that opens in Excel, Numbers, or Google Sheets.

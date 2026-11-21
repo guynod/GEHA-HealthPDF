@@ -2,12 +2,16 @@
 
 import copy
 import csv
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from pypdf import PdfReader
+from PIL import Image, ImageDraw
+from pypdf import PdfReader, PdfWriter, Transformation
+from pypdf.generic import RectangleObject, NumberObject, NameObject
 from reportlab.pdfgen import canvas
 
 import healthpdf
@@ -195,6 +199,145 @@ class ClaimTests(unittest.TestCase):
         del self.profile["subscriber"]["plan_name"]
         del self.profile["subscriber"]["group_number"]
         self.assertTrue(Path(self.prepare()["packet"]).is_file())
+
+    def test_three_decimal_invoice_precision_survives_packet_and_tracker(self):
+        for currency, country in {"BHD": "Bahrain", "IQD": "Iraq", "JOD": "Jordan", "KWD": "Kuwait",
+                                  "LYD": "Libya", "OMR": "Oman", "TND": "Tunisia"}.items():
+            with self.subTest(currency=currency):
+                claim = copy.deepcopy(self.claim)
+                claim["service_country"] = country
+                claim["provider"]["address"] = "123 Example Road, " + country
+                claim["amount"] = {"total": "10.125", "currency": currency}
+                claim["fx"] = {"usd_per_unit": "3.2", "date": "2026-10-01", "source": "Fictional precision test"}
+                result = self.prepare(claim, currency)
+                with (self.root / currency / "tracker.csv").open() as f:
+                    row = next(csv.DictReader(f))
+                self.assertEqual(row["original_amount"], "10.125")
+                self.assertEqual(row["submitted_usd"], "32.40")
+                self.assertIn("10.125 " + currency, (self.root / currency / "email-draft.txt").read_text())
+                self.assertIn("32.40", PdfReader(result["packet"]).pages[0].extract_text())
+        precise = healthpdf.convert("1.235", "KWD", "2026-10-01",
+                                    {"usd_per_unit": "3.2", "date": "2026-10-01", "source": "Fictional rate"})
+        self.assertEqual(precise["usd"], "3.95")
+
+    def test_currency_precision_rejects_unsupported_fractions(self):
+        for value, currency in [("10.125", "USD"), ("10.125", "THB"), ("10.1234", "KWD"), ("10.1", "JPY")]:
+            with self.subTest(value=value, currency=currency), self.assertRaises(ValueError):
+                healthpdf.money(value, currency)
+        self.assertEqual(str(healthpdf.money("125", "JPY")), "125")
+        with self.assertRaises(ValueError):
+            healthpdf.convert("1.234", "KWD", "2026-10-01",
+                               {"actual_usd": "4.125", "date": "2026-10-01", "source": "Fictional payment"})
+
+    def test_eob_name_presentation_changes_preserve_patient_identity(self):
+        self.prepare()
+        eob = {"claim_id": "demo-expense-1", "patient": "Alex Example", "service_date": "2026-10-01",
+               "insurer_claim_number": "DEMO-EOB", "notice_date": "2026-10-05", "status": "paid",
+               "billed_usd": "125.00", "paid_usd": "125.00", "member_share_usd": "0.00", "path": str(self.eob)}
+        for patient in ("ALEX EXAMPLE", " EXAMPLE, ALEX ", "Alex   Example", "Ａｌｅｘ Ｅｘａｍｐｌｅ"):
+            with self.subTest(patient=patient):
+                rows = healthpdf.reconcile(self.root / "packet/tracker.csv", {**eob, "patient": patient})
+                self.assertEqual(rows[0]["patient"], "Alex Example")
+                self.assertEqual(rows[0]["insurer_paid_usd"], "125.00")
+        for change in ({"patient": "Alex J Example"}, {"patient": "A Example"}, {"patient": "Alec Example"},
+                       {"service_date": "2026-10-02"}, {"claim_id": "another-claim"}, {"paid_usd": "125.001"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                healthpdf.reconcile(self.root / "packet/tracker.csv", {**eob, **change})
+        with (self.root / "packet/tracker.csv").open() as f:
+            row = next(csv.DictReader(f))
+        healthpdf.save_tracker(self.root / "duplicates.csv", [row, row])
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            healthpdf.reconcile(self.root / "duplicates.csv", eob)
+
+
+class EvidencePageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def page(self):
+        stream = io.BytesIO()
+        pdf = canvas.Canvas(stream, pagesize=(200, 300))
+        pdf.drawString(20, 25, "VISIBLE BOTTOM")
+        pdf.save()
+        stream.seek(0)
+        return PdfWriter().add_page(PdfReader(stream).pages[0])
+
+    def assert_footer(self, page):
+        positions = []
+        def visit(text, cm, tm, font, size):
+            if "Member ID DEMO-0000" in text:
+                positions.append(Transformation(cm).apply_on((tm[4], tm[5])))
+        page.extract_text(visitor_text=visit)
+        self.assertEqual(page.rotation, 0)
+        self.assertEqual(list(page.cropbox), list(page.mediabox))
+        self.assertEqual(tuple(page.mediabox.lower_left), (0, 0))
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions[0][0], 12)
+        self.assertAlmostEqual(positions[0][1], 3)
+
+    def test_phone_photo_is_letter_sized_oriented_and_original_unchanged(self):
+        path = self.root / "phone-12mp.jpg"
+        photo = Image.new("RGB", (4032, 3024), "white")
+        ImageDraw.Draw(photo).text((30, 30), "FICTIONAL PHOTO RECEIPT", fill="black", font_size=72)
+        exif = photo.getexif()
+        exif[274] = 6
+        photo.save(path, exif=exif)
+        before = healthpdf.digest(path)
+        source = healthpdf.source_pdf(path).pages[0]
+        image = list(source.images)[0].image
+        self.assertEqual(image.size, (1800, 2400))
+        output = healthpdf.annotate_member(source, "DEMO-0000")
+        self.assertEqual((float(output.mediabox.width), float(output.mediabox.height)), (612, 792))
+        self.assert_footer(output)
+        self.assertEqual(healthpdf.digest(path), before)
+
+    def test_heic_and_heif_decode_with_actionable_missing_dependency(self):
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        for suffix in (".heic", ".heif"):
+            path = self.root / ("phone" + suffix)
+            Image.new("RGB", (160, 96), "white").save(path, format="HEIF")
+            before = healthpdf.digest(path)
+            page = healthpdf.annotate_member(healthpdf.source_pdf(path).pages[0], "DEMO-0000")
+            self.assertEqual(len(list(page.images)), 1)
+            self.assertEqual((float(page.mediabox.width), float(page.mediabox.height)), (612, 792))
+            self.assertEqual(healthpdf.digest(path), before)
+        with mock.patch.dict("sys.modules", {"pillow_heif": None}):
+            with self.assertRaisesRegex(ValueError, "convert a copy to JPEG"):
+                healthpdf.source_pdf(path)
+
+    def test_rotated_and_offset_pages_have_upright_visible_footers(self):
+        for rotation in (0, 90, 180, 270):
+            for offset in ((0, 0), (100, 200), (-60, -80)):
+                with self.subTest(rotation=rotation, offset=offset):
+                    page = self.page()
+                    x, y = offset
+                    page.add_transformation(Transformation().translate(tx=x, ty=y))
+                    page.mediabox = RectangleObject((x, y, x + 200, y + 300))
+                    page.cropbox = page.mediabox
+                    page.rotate(rotation)
+                    output = healthpdf.annotate_member(page, "DEMO-0000")
+                    width, height = (300, 200) if rotation in (90, 270) else (200, 300)
+                    self.assertAlmostEqual(float(output.mediabox.width), width)
+                    self.assertAlmostEqual(float(output.mediabox.height), height + 14)
+                    self.assert_footer(output)
+                    self.assertIn("VISIBLE BOTTOM", output.extract_text())
+
+    def test_crop_and_user_units_keep_the_displayed_page_bounds(self):
+        for rotation in (0, 90, 180, 270):
+            page = self.page()
+            page.cropbox = RectangleObject((20, 40, 180, 260))
+            page[NameObject("/UserUnit")] = NumberObject(2)
+            page.rotate(rotation)
+            output = healthpdf.annotate_member(page, "DEMO-0000")
+            width, height = (440, 320) if rotation in (90, 270) else (320, 440)
+            self.assertAlmostEqual(float(output.mediabox.width), width)
+            self.assertAlmostEqual(float(output.mediabox.height), height + 14)
+            self.assert_footer(output)
 
 
 if __name__ == "__main__":
